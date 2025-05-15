@@ -8,7 +8,6 @@
  * Copyright (C) 2024 Emma / InvoxiPlayGames (https://ipg.gay)
  */
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <gccore.h>
@@ -62,8 +61,9 @@ static u8 dvdbuffer[2048] ATTRIBUTE_ALIGN (32);    // One Sector
 
 int main(int argc, char **argv) {
 	int ret;
-	u32 val;
 	u32 mini_nsects, linux_nsects, initrd_nsects;
+	(void)argc;
+	(void)argv;
 
 	// blah blah basic libogc init you know the drill
 	VIDEO_Init();
@@ -235,8 +235,7 @@ armbootnow:
 	printf("something didn't work right! exiting in 10 seconds\n");
 	
 	sleep(10);
-	exit(0);
-	return 0;
+	return 1;
 
 	// ARMBootNow Code Ends
 }
