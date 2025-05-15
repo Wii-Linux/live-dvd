@@ -1,0 +1,18 @@
+# output
+out.iso
+img
+
+# hackmii iso template data
+iso_template.iso
+iso_template.iso.bz2
+
+# compiled loader app data
+app/app.dol
+app/app.elf
+app/build
+
+# files to be packed into iso
+armboot.bin
+zImage
+initrd.cpio*
+rootfs.img
