@@ -17,10 +17,10 @@
 // sector where the boot information will live
 #define BOOTINFO_DVD_SECTOR 192
 
-// version
+// bootInfo version
 #define BOOTINFO_CUR_VERSION 1
 
-// magic, including trailing null
+// bootInfo magic, including trailing null
 static char *bootInfoMagic = "WII-LINUX DVD  ";
 
 typedef struct __attribute__((packed)) {
@@ -43,25 +43,39 @@ typedef struct __attribute__((packed)) {
 	u32   reserved[19];
 }  bootInfo_t;
 
-// mini must be loaded here
+// mini must be loaded here for ARMBootNow to work
 #define MINI_LOAD_ADDR ((u8 *)0x91000000)
 
 // where to dump the kernel size for MINI to see it
 // cached MEM1, a little bit under 16MB
+// this address must be syncronized in MINI
 #define LINUX_SIZE_PTR ((u32 *)0x80FFFFF0)
 
 // DVD sector size
 #define SECT_SIZE 2048
 
-static void *xfb = NULL;
-static GXRModeObj *rmode = NULL;
-
+// scratch variable to read the bootInfo into
 static bootInfo_t bootInfo;
-static u8 dvdbuffer[2048] ATTRIBUTE_ALIGN (32);    // One Sector
+
+// aligned buffer to read sectors from DVD into
+static u8 dvdbuffer[2048] ATTRIBUTE_ALIGN (32);
+
+// macro to handle dvd failures
+#define HANDLE_DVD_FAIL(name) \
+	if (ret) { \
+		printf("DVD read " name " failed: %d\n", ret); \
+		sleep(5); \
+		return 1; \
+	}
 
 int main(int argc, char **argv) {
-	int ret;
-	u32 mini_nsects, linux_nsects, initrd_nsects;
+	int ret; // scratch var for return values
+	u32 nsects; // number of sectors for a read
+
+	// libogc GX junk
+	void *xfb;
+	GXRModeObj *rmode;
+
 	(void)argc;
 	(void)argv;
 
@@ -93,11 +107,7 @@ int main(int argc, char **argv) {
 	// read bootinfo
 	puts("Reading bootInfo...");
 	ret = DVD_LowRead64(dvdbuffer, SECT_SIZE, 192 * SECT_SIZE);
-	if (ret) {
-		printf("DVD read bootInfo failed: %d\n", ret);
-		sleep(5);
-		return 1;
-	}
+	HANDLE_DVD_FAIL("bootInfo");
 	DCFlushRange(&dvdbuffer, sizeof(bootInfo_t)); // nuke the cache
 	memcpy(&bootInfo, dvdbuffer, sizeof(bootInfo_t));
 
@@ -108,54 +118,27 @@ int main(int argc, char **argv) {
 	}
 	puts("bootInfo verified!");
 
-	printf("\
-DEBUG: bootInfo dump:\n\
-magic: \"%s\"\n\
-version: %u\n\
-mini_nbytes: %u\n\
-mini_sectnum: %u\n\
-\n\
-linux_nbytes: %u\n\
-linux_sectnum: %u\n\
-linux_loadaddr: %p\n\
-\n\
-initrd_nbytes: %u\n\
-initrd_sectnum: %u\n\
-initrd_loadaddr: %p\n",
-	bootInfo.magic, bootInfo.version,
-	bootInfo.mini_nbytes, bootInfo.mini_sectnum,
-	bootInfo.linux_nbytes, bootInfo.linux_sectnum, bootInfo.linux_loadaddr,
-	bootInfo.initrd_nbytes, bootInfo.initrd_sectnum, bootInfo.initrd_loadaddr);
-
 	if (bootInfo.version != BOOTINFO_CUR_VERSION) {
 		printf("Invalid bootInfo version (%u), expecting %u\n", bootInfo.version, BOOTINFO_CUR_VERSION);
 		sleep(5);
 		return 1;
 	}
 
-	mini_nsects = (bootInfo.mini_nbytes + (bootInfo.mini_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
+	nsects = (bootInfo.mini_nbytes + (bootInfo.mini_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
-	printf("Loading MINI (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.mini_nbytes, mini_nsects, bootInfo.mini_sectnum, MINI_LOAD_ADDR);
-	ret = DVD_LowRead64(MINI_LOAD_ADDR, mini_nsects * SECT_SIZE, bootInfo.mini_sectnum * SECT_SIZE);
-	if (ret) {
-		printf("DVD read MINI failed: %d\n", ret);
-		sleep(5);
-		return 1;
-	}
+	printf("Loading MINI (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.mini_nbytes, nsects, bootInfo.mini_sectnum, MINI_LOAD_ADDR);
+	ret = DVD_LowRead64(MINI_LOAD_ADDR, nsects * SECT_SIZE, bootInfo.mini_sectnum * SECT_SIZE);
+	HANDLE_DVD_FAIL("MINI");
 	DCFlushRange(MINI_LOAD_ADDR, bootInfo.mini_nbytes); // nuke the cache
 
 	puts("MINI loaded");
 
 
-	linux_nsects = (bootInfo.linux_nbytes + (bootInfo.linux_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
+	nsects = (bootInfo.linux_nbytes + (bootInfo.linux_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
-	printf("Loading Linux kernel (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.linux_nbytes, linux_nsects, bootInfo.linux_sectnum, bootInfo.linux_loadaddr);
-	ret = DVD_LowRead64((u8 *)bootInfo.linux_loadaddr, linux_nsects * SECT_SIZE, bootInfo.linux_sectnum * SECT_SIZE);
-	if (ret) {
-		printf("DVD read Linux failed: %d\n", ret);
-		sleep(5);
-		return 1;
-	}
+	printf("Loading Linux kernel (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.linux_nbytes, nsects, bootInfo.linux_sectnum, bootInfo.linux_loadaddr);
+	ret = DVD_LowRead64((u8 *)bootInfo.linux_loadaddr, nsects * SECT_SIZE, bootInfo.linux_sectnum * SECT_SIZE);
+	HANDLE_DVD_FAIL("Linux");
 	DCFlushRange(bootInfo.linux_loadaddr, bootInfo.linux_nbytes); // nuke the cache
 
 	puts("Linux loaded");
@@ -168,24 +151,15 @@ initrd_loadaddr: %p\n",
 		goto armbootnow;
 	}
 
-	initrd_nsects = (bootInfo.initrd_nbytes + (bootInfo.initrd_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
+	nsects = (bootInfo.initrd_nbytes + (bootInfo.initrd_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
-	printf("Loading initrd (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.initrd_nbytes, initrd_nsects, bootInfo.initrd_sectnum, bootInfo.initrd_loadaddr);
-	ret = DVD_LowRead64((u8 *)bootInfo.initrd_loadaddr, initrd_nsects * SECT_SIZE, bootInfo.initrd_sectnum * SECT_SIZE);
-	if (ret) {
-		printf("DVD read initrd failed: %d\n", ret);
-		sleep(5);
-		return 1;
-	}
+	printf("Loading initrd (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.initrd_nbytes, nsects, bootInfo.initrd_sectnum, bootInfo.initrd_loadaddr);
+	ret = DVD_LowRead64((u8 *)bootInfo.initrd_loadaddr, nsects * SECT_SIZE, bootInfo.initrd_sectnum * SECT_SIZE);
+	HANDLE_DVD_FAIL("initrd");
 
 	puts("initrd loaded");
 
 armbootnow:
-	printf("DEBUG: first 5 bytes of MINI: %02X %02X %02X %02X %02X\n", MINI_LOAD_ADDR[0], MINI_LOAD_ADDR[1], MINI_LOAD_ADDR[2], MINI_LOAD_ADDR[3], MINI_LOAD_ADDR[4]);
-
-	printf("DEBUG: first 5 bytes of Linux: %02X %02X %02X %02X %02X\n", ((u8 *)bootInfo.linux_loadaddr)[0], ((u8 *)bootInfo.linux_loadaddr)[1], ((u8 *)bootInfo.linux_loadaddr)[2], ((u8 *)bootInfo.linux_loadaddr)[3], ((u8 *)bootInfo.linux_loadaddr)[4]);
-
-	puts("DEBUG: ARMBootNow starting, cya!");
 	// ARMBootNow code starts here, credit to InvoxiPlayGames, source: https://github.com/InvoxiPlayGames/ArmbootNow/blob/master/source/armbootnow.c
 
 	// reload IOS to give us a clean slate
