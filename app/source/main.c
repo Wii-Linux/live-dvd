@@ -11,51 +11,32 @@
 #include <string.h>
 #include <unistd.h>
 #include <gccore.h>
+#include <fat.h>
 #include "ios_hax.h"
 #include "gc_dvd.h"
+#include "bootinfo.h"
+#include "mini_memboot.h"
 
-// sector where the boot information will live
-#define BOOTINFO_DVD_SECTOR 192
-
-// bootInfo version
-#define BOOTINFO_CUR_VERSION 1
-
-// bootInfo magic, including trailing null
-static char *bootInfoMagic = "WII-LINUX DVD  ";
-
-typedef struct __attribute__((packed)) {
-	char  magic[16];
-	u32   version;
-
-	u32   mini_nbytes;
-	u32   mini_sectnum;
-
-	u32   linux_nbytes;
-	u32   linux_sectnum;
-	void *linux_loadaddr;
-
-	// if any are 0, then no initrd present
-	u32   initrd_nbytes;
-	u32   initrd_sectnum;
-	void *initrd_loadaddr;
-
-	// 19 more reserved fields to pad to 128 bytes (current struct uses 52)
-	u32   reserved[19];
-}  bootInfo_t;
-
-// mini must be loaded here for ARMBootNow to work
-#define MINI_LOAD_ADDR ((u8 *)0x91000000)
-
-// where to dump the kernel size for MINI to see it
-// cached MEM1, a little bit under 16MB
-// this address must be syncronized in MINI
-#define LINUX_SIZE_PTR ((u32 *)0x80FFFFF0)
+// Enable booting from SD with a stub bootInfo for development/debugging purporses
+// requires:
+//  - bootmii/armboot.bin (MINI)
+//  - wiilinux/dvd.krn (kernel)
+//  - tbd (initramfs)
+#define SD_BOOT_MODE
 
 // DVD sector size
 #define SECT_SIZE 2048
 
+#ifndef SD_BOOT_MODE
 // scratch variable to read the bootInfo into
 static bootInfo_t bootInfo;
+#else
+static bootInfo_t bootInfo = {
+	.magic = { 'W', 'I', 'I', '-', 'L', 'I', 'N', 'U', 'X', ' ', 'D', 'V', 'D', ' ', ' ', '\0' },
+	.version = BOOTINFO_CUR_VERSION,
+	.linux_loadaddr = (void *)0x81000000,
+};
+#endif
 
 // aligned buffer to read sectors from DVD into
 static u8 dvdbuffer[2048] ATTRIBUTE_ALIGN (32);
@@ -68,6 +49,13 @@ static u8 dvdbuffer[2048] ATTRIBUTE_ALIGN (32);
 		return 1; \
 	}
 
+#define die(cond, ...) \
+	if (cond) { \
+		printf(__VA_ARGS__); \
+		sleep(5); \
+		return 1; \
+	}
+
 int main(int argc, char **argv) {
 	int ret; // scratch var for return values
 	u32 nsects; // number of sectors for a read
@@ -75,6 +63,10 @@ int main(int argc, char **argv) {
 	// libogc GX junk
 	void *xfb;
 	GXRModeObj *rmode;
+
+	#ifdef SD_BOOT_MODE
+	FILE *fp;
+	#endif
 
 	(void)argc;
 	(void)argv;
@@ -94,13 +86,10 @@ int main(int argc, char **argv) {
 	puts("\x1b[2;0HWii-Linux DVD Loader v0.1, built on " __DATE__ " " __TIME__);
 
 	// step 1, *make sure* that we have AHBPROT set before we call DVD crap
-	if (!IOSHAX_ClaimPPCKERN()) {
-		puts("Failed to claim PPCKERN in AHBPROT -- cannot possibly continue");
-		sleep(5);
-		return 1;
-	}
+	die(!IOSHAX_ClaimPPCKERN(), "Failed to claim PPCKERN in AHBPROT -- cannot possibly continue\n");
 
 	// Init DVD subsys
+	#ifndef SD_BOOT_MODE
 	puts("Mounting DVD, please wait...");
 	init_dvd();
 
@@ -110,41 +99,75 @@ int main(int argc, char **argv) {
 	HANDLE_DVD_FAIL("bootInfo");
 	DCFlushRange(&dvdbuffer, sizeof(bootInfo_t)); // nuke the cache
 	memcpy(&bootInfo, dvdbuffer, sizeof(bootInfo_t));
+	#endif
 
-	if (memcmp(bootInfo.magic, bootInfoMagic, sizeof(bootInfo.magic))) {
-		puts("Did not read a valid bootInfo block!  Bad disc?");
-		sleep(5);
-		return 0;
-	}
+	die(memcmp(bootInfo.magic, bootInfoMagic, sizeof(bootInfo.magic)) != 0,
+		"Did not read a valid bootInfo block!  Bad disc?\n");
 	puts("bootInfo verified!");
 
-	if (bootInfo.version != BOOTINFO_CUR_VERSION) {
-		printf("Invalid bootInfo version (%u), expecting %u\n", bootInfo.version, BOOTINFO_CUR_VERSION);
-		sleep(5);
-		return 1;
-	}
+	die(bootInfo.version != BOOTINFO_CUR_VERSION,
+		"Invalid bootInfo version (%u), expecting %u\n", bootInfo.version, BOOTINFO_CUR_VERSION);
 
 	nsects = (bootInfo.mini_nbytes + (bootInfo.mini_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
 	printf("Loading MINI (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.mini_nbytes, nsects, bootInfo.mini_sectnum, MINI_LOAD_ADDR);
+	#ifndef SD_BOOT_MODE
 	ret = DVD_LowRead64(MINI_LOAD_ADDR, nsects * SECT_SIZE, bootInfo.mini_sectnum * SECT_SIZE);
 	HANDLE_DVD_FAIL("MINI");
+	#else
+	// do fat init, since this is the first file
+	ret = fatInitDefault();
+	die(!ret, "Failed to init SD card: %d\n", ret);
+	chdir("/");
+
+	fp = fopen("/bootmii/armboot.bin", "rb");
+	die(!fp, "Failed to open armboot.bin\n");
+
+	// get filesize
+	fseek(fp, 0, SEEK_END);
+	size_t size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	// read the file
+	ret = fread(MINI_LOAD_ADDR, 1, size, fp);
+	fclose(fp);
+
+	die(ret != (int)size, "Failed to read armboot.bin: %d\n", ret);
+	bootInfo.mini_nbytes = size;
+	#endif
+
 	DCFlushRange(MINI_LOAD_ADDR, bootInfo.mini_nbytes); // nuke the cache
-
 	puts("MINI loaded");
-
 
 	nsects = (bootInfo.linux_nbytes + (bootInfo.linux_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
 	printf("Loading Linux kernel (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.linux_nbytes, nsects, bootInfo.linux_sectnum, bootInfo.linux_loadaddr);
+	#ifndef SD_BOOT_MODE
 	ret = DVD_LowRead64((u8 *)bootInfo.linux_loadaddr, nsects * SECT_SIZE, bootInfo.linux_sectnum * SECT_SIZE);
 	HANDLE_DVD_FAIL("Linux");
+	#else
+	fp = fopen("/wiilinux/dvd.krn", "rb");
+	die(!fp, "Failed to open dvd.krn\n");
+
+	// get filesize
+	fseek(fp, 0, SEEK_END);
+	size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	// read the file
+	ret = fread((u8 *)bootInfo.linux_loadaddr, 1, size, fp);
+	fclose(fp);
+
+	die(ret != (int)size, "Failed to read dvd.krn: %d\n", ret);
+	bootInfo.linux_nbytes = size;
+	#endif
+
 	DCFlushRange(bootInfo.linux_loadaddr, bootInfo.linux_nbytes); // nuke the cache
 
 	puts("Linux loaded");
-	*LINUX_SIZE_PTR = bootInfo.linux_nbytes;
-	DCFlushRange(LINUX_SIZE_PTR, 4);
-
+	*MEMBOOT_MAGIC_PTR = MEMBOOT_MAGIC;
+	*MEMBOOT_SIZE_PTR = bootInfo.linux_nbytes;
+	DCFlushRange(MEMBOOT_MAGIC_PTR, 8);
 
 	if (bootInfo.initrd_nbytes == 0 || bootInfo.initrd_sectnum == 0 || bootInfo.initrd_loadaddr == 0) {
 		puts("skip initd");
@@ -154,8 +177,25 @@ int main(int argc, char **argv) {
 	nsects = (bootInfo.initrd_nbytes + (bootInfo.initrd_nbytes % SECT_SIZE)) / SECT_SIZE; // round to next sector
 
 	printf("Loading initrd (%u bytes, %u sectors) from sector %u at %p\n", bootInfo.initrd_nbytes, nsects, bootInfo.initrd_sectnum, bootInfo.initrd_loadaddr);
+	#ifndef SD_BOOT_MODE
 	ret = DVD_LowRead64((u8 *)bootInfo.initrd_loadaddr, nsects * SECT_SIZE, bootInfo.initrd_sectnum * SECT_SIZE);
 	HANDLE_DVD_FAIL("initrd");
+	#else
+	fp = fopen("/wiilinux/dvdramfs.img", "rb");
+	die(!fp, "Failed to open dvdramfs.img\n");
+
+	// get filesize
+	fseek(fp, 0, SEEK_END);
+	size = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+
+	// read the file
+	ret = fread((u8 *)bootInfo.initrd_loadaddr, 1, size, fp);
+	fclose(fp);
+
+	die(ret != (int)size, "Failed to read dvdramfs.img: %d\n", ret);
+	bootInfo.initrd_nbytes = size;
+	#endif
 
 	puts("initrd loaded");
 
@@ -207,7 +247,7 @@ armbootnow:
 	}
 
 	printf("something didn't work right! exiting in 10 seconds\n");
-	
+
 	sleep(10);
 	return 1;
 
