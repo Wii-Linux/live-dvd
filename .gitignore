@@ -1,5 +1,6 @@
 # output
 out.iso
+wit_out.iso
 img
 
 # hackmii iso template data
@@ -16,3 +17,4 @@ armboot.bin
 zImage
 initrd.cpio*
 rootfs.img
+base_iso9660.iso

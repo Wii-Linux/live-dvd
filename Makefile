@@ -1,15 +1,15 @@
-.PHONY: img_built img_extracted app_built clean
+.PHONY: clean
 
 all: out.iso
 
-out.iso: img_built
-	wit cp img out.iso --region=1 --ios=36 --id=WIILNX --common-key=0 --name='Wii-Linux Installation Media' --modify=DISC,BOOT,TMD,TICKET -o
-	python pack_into_iso.py
+wit_out.iso: img/sys/main.dol
+	wit cp img wit_out.iso --trunc --region=1 --ios=36 --id=WIILNX --common-key=0 --name='Wii-Linux Installation Media' --modify=DISC,BOOT,TMD,TICKET -o
 
-img_built: img_extracted app_built
+out.iso: wit_out.iso base_iso9660.iso
+	python3 pack_into_iso.py
+
+img/sys/main.dol: img/sys/apploader.img app/app.dol
 	cp app/app.dol img/sys/main.dol
-
-img_extracted: iso_template.iso img/sys/apploader.img
 
 # 'wit' breaks if the destination already exists
 # if we need to regenerate the entire thing anyways,
@@ -24,5 +24,5 @@ iso_template.iso: iso_template.iso.bz2
 iso_template.iso.bz2:
 	wget https://static.hackmii.com/iso_template.iso.bz2
 
-app_built:
+app/app.dol:
 	make -C app $(MAKEFLAGS)
